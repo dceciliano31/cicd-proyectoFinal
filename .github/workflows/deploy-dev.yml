@@ -1,4 +1,4 @@
-name: Deploy Databricks Project and Create Workflow
+name: Deploy to Production from GitHub and Run Databricks Workflow
 
 on:
   push:
@@ -8,31 +8,67 @@ on:
 
 env:
   WORKSPACE_PROJECT_PATH: /Shared/proyectoFinal
-  WORKFLOW_NAME: WF_proyectoFinal_dev
-  CLUSTER_NAME: cl_proyectoFinal
+  WORKFLOW_NAME: WF_proyectoFinal_prod
+  PROD_CLUSTER_NAME: cl_proyectoFinal
 
 jobs:
-  deploy:
+  deploy-to-prod:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install jq & curl
+      - name: Install jq and curl
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl
 
       - name: Validate required secrets
         run: |
-          test -n "${{ secrets.DATABRICKS_HOST }}" || (echo "Falta DATABRICKS_HOST" && exit 1)
-          test -n "${{ secrets.DATABRICKS_TOKEN }}" || (echo "Falta DATABRICKS_TOKEN" && exit 1)
+          test -n "${{ secrets.DATABRICKS_ORIGIN_HOST }}" || (echo "Falta DATABRICKS_ORIGIN_HOST" && exit 1)
+          test -n "${{ secrets.DATABRICKS_ORIGIN_TOKEN }}" || (echo "Falta DATABRICKS_ORIGIN_TOKEN" && exit 1)
+          test -n "${{ secrets.DATABRICKS_DEST_HOST }}" || (echo "Falta DATABRICKS_DEST_HOST" && exit 1)
+          test -n "${{ secrets.DATABRICKS_DEST_TOKEN }}" || (echo "Falta DATABRICKS_DEST_TOKEN" && exit 1)
 
-      - name: Create workspace folders
+      - name: Validate origin workspace connectivity
         run: |
-          HOST="${{ secrets.DATABRICKS_HOST }}"
-          TOKEN="${{ secrets.DATABRICKS_TOKEN }}"
+          ORIGIN_HOST="${{ secrets.DATABRICKS_ORIGIN_HOST }}"
+          ORIGIN_TOKEN="${{ secrets.DATABRICKS_ORIGIN_TOKEN }}"
+
+          response=$(curl -s -X GET \
+            -H "Authorization: Bearer $ORIGIN_TOKEN" \
+            "$ORIGIN_HOST/api/2.0/clusters/list")
+
+          if echo "$response" | jq -e '.clusters' > /dev/null; then
+            echo "Conexión al workspace origen OK"
+          else
+            echo "No se pudo validar conexión al workspace origen"
+            echo "$response"
+            exit 1
+          fi
+
+      - name: Validate destination workspace connectivity
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+
+          response=$(curl -s -X GET \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.0/clusters/list")
+
+          if echo "$response" | jq -e '.clusters' > /dev/null; then
+            echo "Conexión al workspace destino OK"
+          else
+            echo "No se pudo validar conexión al workspace destino"
+            echo "$response"
+            exit 1
+          fi
+
+      - name: Create destination workspace folders
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
 
           for path in \
             "${WORKSPACE_PROJECT_PATH}" \
@@ -43,16 +79,16 @@ jobs:
           do
             echo "Creando carpeta: $path"
             curl -s -X POST \
-              -H "Authorization: Bearer $TOKEN" \
+              -H "Authorization: Bearer $DEST_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{\"path\":\"$path\"}" \
-              "$HOST/api/2.0/workspace/mkdirs"
+              "$DEST_HOST/api/2.0/workspace/mkdirs"
           done
 
-      - name: Import Python notebooks to Databricks Workspace
+      - name: Import Python notebooks to destination workspace
         run: |
-          HOST="${{ secrets.DATABRICKS_HOST }}"
-          TOKEN="${{ secrets.DATABRICKS_TOKEN }}"
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
 
           import_py () {
             local src_file="$1"
@@ -61,33 +97,31 @@ jobs:
             echo "Importando $src_file -> $dest_path"
 
             response=$(curl -s -X POST \
-              -H "Authorization: Bearer $TOKEN" \
+              -H "Authorization: Bearer $DEST_TOKEN" \
               -F "path=$dest_path" \
               -F "format=SOURCE" \
               -F "language=PYTHON" \
               -F "overwrite=true" \
               -F "content=@$src_file" \
-              "$HOST/api/2.0/workspace/import")
+              "$DEST_HOST/api/2.0/workspace/import")
 
-            echo "Response: $response"
+            echo "$response"
           }
 
-          # PrepAmb como notebooks Python
           import_py "PrepAmb/01_create_catalog_and_schemas.py" "${WORKSPACE_PROJECT_PATH}/PrepAmb/01_create_catalog_and_schemas"
           import_py "PrepAmb/02_create_external_location.py" "${WORKSPACE_PROJECT_PATH}/PrepAmb/02_create_external_location"
           import_py "PrepAmb/03_create_gold_views.py" "${WORKSPACE_PROJECT_PATH}/PrepAmb/03_create_gold_views"
 
-          # Proceso ETL
           import_py "proceso/00_config.py" "${WORKSPACE_PROJECT_PATH}/proceso/00_config"
           import_py "proceso/01_raw_to_bronze.py" "${WORKSPACE_PROJECT_PATH}/proceso/01_raw_to_bronze"
           import_py "proceso/02_bronze_to_silver.py" "${WORKSPACE_PROJECT_PATH}/proceso/02_bronze_to_silver"
           import_py "proceso/03_silver_to_gold_star_schema.py" "${WORKSPACE_PROJECT_PATH}/proceso/03_silver_to_gold_star_schema"
           import_py "proceso/04_data_quality_checks.py" "${WORKSPACE_PROJECT_PATH}/proceso/04_data_quality_checks"
 
-      - name: Import support SQL files
+      - name: Import support SQL files to destination workspace
         run: |
-          HOST="${{ secrets.DATABRICKS_HOST }}"
-          TOKEN="${{ secrets.DATABRICKS_TOKEN }}"
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
 
           import_sql () {
             local src_file="$1"
@@ -96,78 +130,67 @@ jobs:
             echo "Importando $src_file -> $dest_path"
 
             response=$(curl -s -X POST \
-              -H "Authorization: Bearer $TOKEN" \
+              -H "Authorization: Bearer $DEST_TOKEN" \
               -F "path=$dest_path" \
               -F "format=SOURCE" \
               -F "language=SQL" \
               -F "overwrite=true" \
               -F "content=@$src_file" \
-              "$HOST/api/2.0/workspace/import")
+              "$DEST_HOST/api/2.0/workspace/import")
 
-            echo "Response: $response"
+            echo "$response"
           }
 
           import_sql "seguridad/01_grants.sql" "${WORKSPACE_PROJECT_PATH}/seguridad/01_grants"
           import_sql "reversion/01_drop_objects.sql" "${WORKSPACE_PROJECT_PATH}/reversion/01_drop_objects"
 
-      - name: Check if workflow exists and delete if necessary
+      - name: Get production cluster ID
         run: |
-          HOST="${{ secrets.DATABRICKS_HOST }}"
-          TOKEN="${{ secrets.DATABRICKS_TOKEN }}"
-          WORKFLOW_NAME="${WORKFLOW_NAME}"
-
-          echo "Verificando si existe el workflow: $WORKFLOW_NAME"
-
-          workflows_response=$(curl -s -X GET \
-            -H "Authorization: Bearer $TOKEN" \
-            "$HOST/api/2.1/jobs/list")
-
-          existing_job_id=$(echo "$workflows_response" | jq -r --arg name "$WORKFLOW_NAME" '.jobs[]? | select(.settings.name == $name) | .job_id')
-
-          if [ -n "$existing_job_id" ] && [ "$existing_job_id" != "null" ]; then
-            echo "Workflow encontrado con ID: $existing_job_id. Eliminando..."
-            delete_response=$(curl -s -X POST \
-              -H "Authorization: Bearer $TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"job_id\": $existing_job_id}" \
-              "$HOST/api/2.1/jobs/delete")
-            echo "Delete response: $delete_response"
-          else
-            echo "No se encontró workflow existente con nombre: $WORKFLOW_NAME"
-          fi
-
-      - name: Get existing cluster ID
-        run: |
-          HOST="${{ secrets.DATABRICKS_HOST }}"
-          TOKEN="${{ secrets.DATABRICKS_TOKEN }}"
-          CLUSTER_NAME="${CLUSTER_NAME}"
-
-          echo "Buscando cluster existente: $CLUSTER_NAME"
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
 
           clusters_response=$(curl -s -X GET \
-            -H "Authorization: Bearer $TOKEN" \
-            "$HOST/api/2.0/clusters/list")
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.0/clusters/list")
 
-          cluster_id=$(echo "$clusters_response" | jq -r --arg name "$CLUSTER_NAME" '.clusters[]? | select(.cluster_name == $name) | .cluster_id')
+          cluster_id=$(echo "$clusters_response" | jq -r --arg name "$PROD_CLUSTER_NAME" '.clusters[]? | select(.cluster_name == $name) | .cluster_id')
 
-          if [ -n "$cluster_id" ] && [ "$cluster_id" != "null" ]; then
-            echo "Cluster encontrado: $CLUSTER_NAME con ID: $cluster_id"
-            echo "CLUSTER_ID=$cluster_id" >> $GITHUB_ENV
-          else
-            echo "No se encontró el cluster: $CLUSTER_NAME"
-            echo "Clusters disponibles:"
+          if [ -z "$cluster_id" ] || [ "$cluster_id" = "null" ]; then
+            echo "No se encontró el cluster de producción: $PROD_CLUSTER_NAME"
             echo "$clusters_response" | jq -r '.clusters[]? | .cluster_name'
             exit 1
           fi
 
-      - name: Create Databricks Workflow
-        run: |
-          HOST="${{ secrets.DATABRICKS_HOST }}"
-          TOKEN="${{ secrets.DATABRICKS_TOKEN }}"
-          DEST_BASE="${WORKSPACE_PROJECT_PATH}"
-          CLUSTER_ID="${{ env.CLUSTER_ID }}"
+          echo "CLUSTER_ID=$cluster_id" >> $GITHUB_ENV
+          echo "Cluster de producción encontrado: $cluster_id"
 
-          echo "Creando workflow: ${WORKFLOW_NAME}"
+      - name: Delete existing production workflow if exists
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+
+          jobs_response=$(curl -s -X GET \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.1/jobs/list")
+
+          existing_job_id=$(echo "$jobs_response" | jq -r --arg name "$WORKFLOW_NAME" '.jobs[]? | select(.settings.name == $name) | .job_id')
+
+          if [ -n "$existing_job_id" ] && [ "$existing_job_id" != "null" ]; then
+            echo "Eliminando workflow previo: $existing_job_id"
+            curl -s -X POST \
+              -H "Authorization: Bearer $DEST_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"job_id\": $existing_job_id}" \
+              "$DEST_HOST/api/2.1/jobs/delete"
+          else
+            echo "No existe workflow previo con nombre ${WORKFLOW_NAME}"
+          fi
+
+      - name: Create production workflow
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+          CLUSTER_ID="${{ env.CLUSTER_ID }}"
 
           cat > workflow_config.json <<EOF
           {
@@ -176,17 +199,16 @@ jobs:
             "max_concurrent_runs": 1,
             "timeout_seconds": 14400,
             "tags": {
-              "environment": "dev",
-              "created_by": "github_actions",
+              "environment": "prod",
               "project": "proyectoFinal",
-              "cluster_used": "${CLUSTER_NAME}"
+              "source_env": "origin",
+              "deployed_from": "github_actions"
             },
             "tasks": [
               {
                 "task_key": "create_catalog_and_schemas",
-                "description": "Crea catálogo y schemas del proyecto",
                 "notebook_task": {
-                  "notebook_path": "${DEST_BASE}/PrepAmb/01_create_catalog_and_schemas",
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/PrepAmb/01_create_catalog_and_schemas",
                   "source": "WORKSPACE",
                   "base_parameters": {
                     "catalog_name": "proyectoFinal",
@@ -203,12 +225,11 @@ jobs:
               },
               {
                 "task_key": "create_external_location",
-                "description": "Crea external locations por contenedor",
                 "depends_on": [
                   { "task_key": "create_catalog_and_schemas" }
                 ],
                 "notebook_task": {
-                  "notebook_path": "${DEST_BASE}/PrepAmb/02_create_external_location",
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/PrepAmb/02_create_external_location",
                   "source": "WORKSPACE",
                   "base_parameters": {
                     "storage_account": "asaproyecto",
@@ -231,12 +252,11 @@ jobs:
               },
               {
                 "task_key": "raw_to_bronze",
-                "description": "Carga archivos CSV desde raw a bronze",
                 "depends_on": [
                   { "task_key": "create_external_location" }
                 ],
                 "notebook_task": {
-                  "notebook_path": "${DEST_BASE}/proceso/01_raw_to_bronze",
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/proceso/01_raw_to_bronze",
                   "source": "WORKSPACE",
                   "base_parameters": {
                     "catalog_name": "proyectoFinal",
@@ -264,12 +284,11 @@ jobs:
               },
               {
                 "task_key": "bronze_to_silver",
-                "description": "Transforma datos de bronze a silver",
                 "depends_on": [
                   { "task_key": "raw_to_bronze" }
                 ],
                 "notebook_task": {
-                  "notebook_path": "${DEST_BASE}/proceso/02_bronze_to_silver",
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/proceso/02_bronze_to_silver",
                   "source": "WORKSPACE",
                   "base_parameters": {
                     "catalog_name": "proyectoFinal",
@@ -285,12 +304,11 @@ jobs:
               },
               {
                 "task_key": "silver_to_gold_star_schema",
-                "description": "Construye el modelo estrella en gold",
                 "depends_on": [
                   { "task_key": "bronze_to_silver" }
                 ],
                 "notebook_task": {
-                  "notebook_path": "${DEST_BASE}/proceso/03_silver_to_gold_star_schema",
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/proceso/03_silver_to_gold_star_schema",
                   "source": "WORKSPACE",
                   "base_parameters": {
                     "catalog_name": "proyectoFinal",
@@ -306,12 +324,11 @@ jobs:
               },
               {
                 "task_key": "create_gold_views",
-                "description": "Crea vistas Gold para Power BI",
                 "depends_on": [
                   { "task_key": "silver_to_gold_star_schema" }
                 ],
                 "notebook_task": {
-                  "notebook_path": "${DEST_BASE}/PrepAmb/03_create_gold_views",
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/PrepAmb/03_create_gold_views",
                   "source": "WORKSPACE",
                   "base_parameters": {
                     "catalog_name": "proyectoFinal",
@@ -324,12 +341,11 @@ jobs:
               },
               {
                 "task_key": "data_quality_checks",
-                "description": "Valida calidad del modelo final",
                 "depends_on": [
                   { "task_key": "create_gold_views" }
                 ],
                 "notebook_task": {
-                  "notebook_path": "${DEST_BASE}/proceso/04_data_quality_checks",
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/proceso/04_data_quality_checks",
                   "source": "WORKSPACE",
                   "base_parameters": {
                     "catalog_name": "proyectoFinal",
@@ -345,78 +361,50 @@ jobs:
           EOF
 
           create_response=$(curl -s -X POST \
-            -H "Authorization: Bearer $TOKEN" \
+            -H "Authorization: Bearer $DEST_TOKEN" \
             -H "Content-Type: application/json" \
             -d @workflow_config.json \
-            "$HOST/api/2.1/jobs/create")
+            "$DEST_HOST/api/2.1/jobs/create")
 
-          echo "Workflow creation response: $create_response"
+          echo "$create_response"
 
           job_id=$(echo "$create_response" | jq -r '.job_id')
 
-          if [ -n "$job_id" ] && [ "$job_id" != "null" ]; then
-            echo "Workflow creado exitosamente con ID: $job_id"
-            echo "JOB_ID=$job_id" >> $GITHUB_ENV
-          else
-            echo "Error al crear el workflow"
-            echo "Response completo: $create_response"
+          if [ -z "$job_id" ] || [ "$job_id" = "null" ]; then
+            echo "No se pudo crear el workflow de producción"
             exit 1
           fi
 
-      - name: Validate Workflow Configuration
+          echo "JOB_ID=$job_id" >> $GITHUB_ENV
+          echo "Workflow PROD creado con job_id=$job_id"
+
+      - name: Run production workflow
         run: |
-          HOST="${{ secrets.DATABRICKS_HOST }}"
-          TOKEN="${{ secrets.DATABRICKS_TOKEN }}"
-
-          workflows_list=$(curl -s -X GET \
-            -H "Authorization: Bearer $TOKEN" \
-            "$HOST/api/2.1/jobs/list")
-
-          job_id=$(echo "$workflows_list" | jq -r --arg name "$WORKFLOW_NAME" '.jobs[]? | select(.settings.name == $name) | .job_id')
-
-          if [ -n "$job_id" ] && [ "$job_id" != "null" ]; then
-            echo "Workflow encontrado con ID: $job_id"
-
-            job_details=$(curl -s -X GET \
-              -H "Authorization: Bearer $TOKEN" \
-              "$HOST/api/2.1/jobs/get?job_id=$job_id")
-
-            echo "Resumen del workflow:"
-            echo "Nombre: $(echo "$job_details" | jq -r '.settings.name')"
-            echo "Número de tareas: $(echo "$job_details" | jq '.settings.tasks | length')"
-            echo "$job_details" | jq '.settings.tasks | map({task_key, notebook_path: .notebook_task.notebook_path, depends_on})'
-          else
-            echo "No se encontró el workflow luego de crearlo"
-            exit 1
-          fi
-
-      - name: Run workflow
-        run: |
-          HOST="${{ secrets.DATABRICKS_HOST }}"
-          TOKEN="${{ secrets.DATABRICKS_TOKEN }}"
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
           JOB_ID="${{ env.JOB_ID }}"
 
           run_response=$(curl -s -X POST \
-            -H "Authorization: Bearer $TOKEN" \
+            -H "Authorization: Bearer $DEST_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"job_id\": $JOB_ID}" \
-            "$HOST/api/2.1/jobs/run-now")
+            "$DEST_HOST/api/2.1/jobs/run-now")
 
-          echo "Run response: $run_response"
+          echo "$run_response"
 
           run_id=$(echo "$run_response" | jq -r '.run_id')
 
-          if [ -n "$run_id" ] && [ "$run_id" != "null" ]; then
-            echo "RUN_ID=$run_id" >> $GITHUB_ENV
-          else
-            echo "No se pudo ejecutar el workflow"
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "No se pudo ejecutar el workflow de producción"
             exit 1
           fi
 
-      - name: Monitor workflow execution
+          echo "RUN_ID=$run_id" >> $GITHUB_ENV
+
+      - name: Monitor production workflow execution
         run: |
-          HOST="${{ secrets.DATABRICKS_HOST }}"
-          TOKEN="${{ secrets.DATABRICKS_TOKEN }}"
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
           RUN_ID="${{ env.RUN_ID }}"
 
           max_wait=3600
@@ -425,27 +413,27 @@ jobs:
 
           while [ $waited -lt $max_wait ]; do
             run_status=$(curl -s -X GET \
-              -H "Authorization: Bearer $TOKEN" \
-              "$HOST/api/2.1/jobs/runs/get?run_id=$RUN_ID")
+              -H "Authorization: Bearer $DEST_TOKEN" \
+              "$DEST_HOST/api/2.1/jobs/runs/get?run_id=$RUN_ID")
 
             life_cycle=$(echo "$run_status" | jq -r '.state.life_cycle_state')
             result_state=$(echo "$run_status" | jq -r '.state.result_state // "RUNNING"')
 
-            echo "Estado actual: $life_cycle / $result_state"
+            echo "Estado PROD: $life_cycle / $result_state"
 
             if [ "$life_cycle" = "TERMINATED" ]; then
               if [ "$result_state" = "SUCCESS" ]; then
-                echo "Workflow ejecutado correctamente"
+                echo "Workflow PROD ejecutado correctamente"
                 exit 0
               else
-                echo "Workflow terminó con error"
+                echo "Workflow PROD terminó con error"
                 echo "$run_status" | jq '.'
                 exit 1
               fi
             fi
 
             if [ "$life_cycle" = "INTERNAL_ERROR" ] || [ "$life_cycle" = "SKIPPED" ]; then
-              echo "Workflow falló"
+              echo "Workflow PROD falló"
               echo "$run_status" | jq '.'
               exit 1
             fi
@@ -454,5 +442,5 @@ jobs:
             waited=$((waited + interval))
           done
 
-          echo "Timeout monitoreando workflow"
+          echo "Timeout monitoreando workflow PROD"
           exit 1
