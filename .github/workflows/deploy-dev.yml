@@ -1,0 +1,446 @@
+name: Deploy to Production from GitHub and Run Databricks Workflow
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  WORKSPACE_PROJECT_PATH: /Shared/proyectoFinal
+  WORKFLOW_NAME: WF_proyectoFinal_prod
+  PROD_CLUSTER_NAME: cl_proyectoFinal
+
+jobs:
+  deploy-to-prod:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install jq and curl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Validate required secrets
+        run: |
+          test -n "${{ secrets.DATABRICKS_ORIGIN_HOST }}" || (echo "Falta DATABRICKS_ORIGIN_HOST" && exit 1)
+          test -n "${{ secrets.DATABRICKS_ORIGIN_TOKEN }}" || (echo "Falta DATABRICKS_ORIGIN_TOKEN" && exit 1)
+          test -n "${{ secrets.DATABRICKS_DEST_HOST }}" || (echo "Falta DATABRICKS_DEST_HOST" && exit 1)
+          test -n "${{ secrets.DATABRICKS_DEST_TOKEN }}" || (echo "Falta DATABRICKS_DEST_TOKEN" && exit 1)
+
+      - name: Validate origin workspace connectivity
+        run: |
+          ORIGIN_HOST="${{ secrets.DATABRICKS_ORIGIN_HOST }}"
+          ORIGIN_TOKEN="${{ secrets.DATABRICKS_ORIGIN_TOKEN }}"
+
+          response=$(curl -s -X GET \
+            -H "Authorization: Bearer $ORIGIN_TOKEN" \
+            "$ORIGIN_HOST/api/2.0/clusters/list")
+
+          if echo "$response" | jq -e '.clusters' > /dev/null; then
+            echo "Conexión al workspace origen OK"
+          else
+            echo "No se pudo validar conexión al workspace origen"
+            echo "$response"
+            exit 1
+          fi
+
+      - name: Validate destination workspace connectivity
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+
+          response=$(curl -s -X GET \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.0/clusters/list")
+
+          if echo "$response" | jq -e '.clusters' > /dev/null; then
+            echo "Conexión al workspace destino OK"
+          else
+            echo "No se pudo validar conexión al workspace destino"
+            echo "$response"
+            exit 1
+          fi
+
+      - name: Create destination workspace folders
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+
+          for path in \
+            "${WORKSPACE_PROJECT_PATH}" \
+            "${WORKSPACE_PROJECT_PATH}/PrepAmb" \
+            "${WORKSPACE_PROJECT_PATH}/proceso" \
+            "${WORKSPACE_PROJECT_PATH}/seguridad" \
+            "${WORKSPACE_PROJECT_PATH}/reversion"
+          do
+            echo "Creando carpeta: $path"
+            curl -s -X POST \
+              -H "Authorization: Bearer $DEST_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"path\":\"$path\"}" \
+              "$DEST_HOST/api/2.0/workspace/mkdirs"
+          done
+
+      - name: Import Python notebooks to destination workspace
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+
+          import_py () {
+            local src_file="$1"
+            local dest_path="$2"
+
+            echo "Importando $src_file -> $dest_path"
+
+            response=$(curl -s -X POST \
+              -H "Authorization: Bearer $DEST_TOKEN" \
+              -F "path=$dest_path" \
+              -F "format=SOURCE" \
+              -F "language=PYTHON" \
+              -F "overwrite=true" \
+              -F "content=@$src_file" \
+              "$DEST_HOST/api/2.0/workspace/import")
+
+            echo "$response"
+          }
+
+          import_py "PrepAmb/01_create_catalog_and_schemas.py" "${WORKSPACE_PROJECT_PATH}/PrepAmb/01_create_catalog_and_schemas"
+          import_py "PrepAmb/02_create_external_location.py" "${WORKSPACE_PROJECT_PATH}/PrepAmb/02_create_external_location"
+          import_py "PrepAmb/03_create_gold_views.py" "${WORKSPACE_PROJECT_PATH}/PrepAmb/03_create_gold_views"
+
+          import_py "proceso/00_config.py" "${WORKSPACE_PROJECT_PATH}/proceso/00_config"
+          import_py "proceso/01_raw_to_bronze.py" "${WORKSPACE_PROJECT_PATH}/proceso/01_raw_to_bronze"
+          import_py "proceso/02_bronze_to_silver.py" "${WORKSPACE_PROJECT_PATH}/proceso/02_bronze_to_silver"
+          import_py "proceso/03_silver_to_gold_star_schema.py" "${WORKSPACE_PROJECT_PATH}/proceso/03_silver_to_gold_star_schema"
+          import_py "proceso/04_data_quality_checks.py" "${WORKSPACE_PROJECT_PATH}/proceso/04_data_quality_checks"
+
+      - name: Import support SQL files to destination workspace
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+
+          import_sql () {
+            local src_file="$1"
+            local dest_path="$2"
+
+            echo "Importando $src_file -> $dest_path"
+
+            response=$(curl -s -X POST \
+              -H "Authorization: Bearer $DEST_TOKEN" \
+              -F "path=$dest_path" \
+              -F "format=SOURCE" \
+              -F "language=SQL" \
+              -F "overwrite=true" \
+              -F "content=@$src_file" \
+              "$DEST_HOST/api/2.0/workspace/import")
+
+            echo "$response"
+          }
+
+          import_sql "seguridad/01_grants.sql" "${WORKSPACE_PROJECT_PATH}/seguridad/01_grants"
+          import_sql "reversion/01_drop_objects.sql" "${WORKSPACE_PROJECT_PATH}/reversion/01_drop_objects"
+
+      - name: Get production cluster ID
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+
+          clusters_response=$(curl -s -X GET \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.0/clusters/list")
+
+          cluster_id=$(echo "$clusters_response" | jq -r --arg name "$PROD_CLUSTER_NAME" '.clusters[]? | select(.cluster_name == $name) | .cluster_id')
+
+          if [ -z "$cluster_id" ] || [ "$cluster_id" = "null" ]; then
+            echo "No se encontró el cluster de producción: $PROD_CLUSTER_NAME"
+            echo "$clusters_response" | jq -r '.clusters[]? | .cluster_name'
+            exit 1
+          fi
+
+          echo "CLUSTER_ID=$cluster_id" >> $GITHUB_ENV
+          echo "Cluster de producción encontrado: $cluster_id"
+
+      - name: Delete existing production workflow if exists
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+
+          jobs_response=$(curl -s -X GET \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.1/jobs/list")
+
+          existing_job_id=$(echo "$jobs_response" | jq -r --arg name "$WORKFLOW_NAME" '.jobs[]? | select(.settings.name == $name) | .job_id')
+
+          if [ -n "$existing_job_id" ] && [ "$existing_job_id" != "null" ]; then
+            echo "Eliminando workflow previo: $existing_job_id"
+            curl -s -X POST \
+              -H "Authorization: Bearer $DEST_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"job_id\": $existing_job_id}" \
+              "$DEST_HOST/api/2.1/jobs/delete"
+          else
+            echo "No existe workflow previo con nombre ${WORKFLOW_NAME}"
+          fi
+
+      - name: Create production workflow
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+          CLUSTER_ID="${{ env.CLUSTER_ID }}"
+
+          cat > workflow_config.json <<EOF
+          {
+            "name": "${WORKFLOW_NAME}",
+            "format": "MULTI_TASK",
+            "max_concurrent_runs": 1,
+            "timeout_seconds": 14400,
+            "tags": {
+              "environment": "prod",
+              "project": "proyectoFinal",
+              "source_env": "origin",
+              "deployed_from": "github_actions"
+            },
+            "tasks": [
+              {
+                "task_key": "create_catalog_and_schemas",
+                "notebook_task": {
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/PrepAmb/01_create_catalog_and_schemas",
+                  "source": "WORKSPACE",
+                  "base_parameters": {
+                    "catalog_name": "proyectoFinal",
+                    "raw_schema": "raw",
+                    "bronze_schema": "bronze",
+                    "silver_schema": "silver",
+                    "gold_schema": "gold",
+                    "storage_account": "asaproyecto"
+                  }
+                },
+                "existing_cluster_id": "${CLUSTER_ID}",
+                "timeout_seconds": 1800,
+                "max_retries": 1
+              },
+              {
+                "task_key": "create_external_location",
+                "depends_on": [
+                  { "task_key": "create_catalog_and_schemas" }
+                ],
+                "notebook_task": {
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/PrepAmb/02_create_external_location",
+                  "source": "WORKSPACE",
+                  "base_parameters": {
+                    "storage_account": "asaproyecto",
+                    "storage_credential_name": "credential",
+                    "raw_container": "raw",
+                    "bronze_container": "bronze",
+                    "silver_container": "silver",
+                    "gold_container": "gold",
+                    "external_location_raw": "exlt_raw",
+                    "external_location_bronze": "exlt_bronze",
+                    "external_location_silver": "exlt_silver",
+                    "external_location_gold": "exlt_gold",
+                    "read_principal": "datareaders",
+                    "write_principal": "dataengineers"
+                  }
+                },
+                "existing_cluster_id": "${CLUSTER_ID}",
+                "timeout_seconds": 1800,
+                "max_retries": 1
+              },
+              {
+                "task_key": "raw_to_bronze",
+                "depends_on": [
+                  { "task_key": "create_external_location" }
+                ],
+                "notebook_task": {
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/proceso/01_raw_to_bronze",
+                  "source": "WORKSPACE",
+                  "base_parameters": {
+                    "catalog_name": "proyectoFinal",
+                    "raw_schema": "raw",
+                    "bronze_schema": "bronze",
+                    "silver_schema": "silver",
+                    "gold_schema": "gold",
+                    "storage_account": "asaproyecto",
+                    "raw_container": "raw",
+                    "bronze_container": "bronze",
+                    "silver_container": "silver",
+                    "gold_container": "gold",
+                    "read_principal": "datareaders",
+                    "write_principal": "dataengineers",
+                    "storage_credential_name": "credential",
+                    "external_location_raw": "exlt_raw",
+                    "external_location_bronze": "exlt_bronze",
+                    "external_location_silver": "exlt_silver",
+                    "external_location_gold": "exlt_gold"
+                  }
+                },
+                "existing_cluster_id": "${CLUSTER_ID}",
+                "timeout_seconds": 3600,
+                "max_retries": 1
+              },
+              {
+                "task_key": "bronze_to_silver",
+                "depends_on": [
+                  { "task_key": "raw_to_bronze" }
+                ],
+                "notebook_task": {
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/proceso/02_bronze_to_silver",
+                  "source": "WORKSPACE",
+                  "base_parameters": {
+                    "catalog_name": "proyectoFinal",
+                    "raw_schema": "raw",
+                    "bronze_schema": "bronze",
+                    "silver_schema": "silver",
+                    "gold_schema": "gold"
+                  }
+                },
+                "existing_cluster_id": "${CLUSTER_ID}",
+                "timeout_seconds": 3600,
+                "max_retries": 1
+              },
+              {
+                "task_key": "silver_to_gold_star_schema",
+                "depends_on": [
+                  { "task_key": "bronze_to_silver" }
+                ],
+                "notebook_task": {
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/proceso/03_silver_to_gold_star_schema",
+                  "source": "WORKSPACE",
+                  "base_parameters": {
+                    "catalog_name": "proyectoFinal",
+                    "raw_schema": "raw",
+                    "bronze_schema": "bronze",
+                    "silver_schema": "silver",
+                    "gold_schema": "gold"
+                  }
+                },
+                "existing_cluster_id": "${CLUSTER_ID}",
+                "timeout_seconds": 3600,
+                "max_retries": 1
+              },
+              {
+                "task_key": "create_gold_views",
+                "depends_on": [
+                  { "task_key": "silver_to_gold_star_schema" }
+                ],
+                "notebook_task": {
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/PrepAmb/03_create_gold_views",
+                  "source": "WORKSPACE",
+                  "base_parameters": {
+                    "catalog_name": "proyectoFinal",
+                    "gold_schema": "gold"
+                  }
+                },
+                "existing_cluster_id": "${CLUSTER_ID}",
+                "timeout_seconds": 1800,
+                "max_retries": 1
+              },
+              {
+                "task_key": "data_quality_checks",
+                "depends_on": [
+                  { "task_key": "create_gold_views" }
+                ],
+                "notebook_task": {
+                  "notebook_path": "${WORKSPACE_PROJECT_PATH}/proceso/04_data_quality_checks",
+                  "source": "WORKSPACE",
+                  "base_parameters": {
+                    "catalog_name": "proyectoFinal",
+                    "gold_schema": "gold"
+                  }
+                },
+                "existing_cluster_id": "${CLUSTER_ID}",
+                "timeout_seconds": 1800,
+                "max_retries": 1
+              }
+            ]
+          }
+          EOF
+
+          create_response=$(curl -s -X POST \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @workflow_config.json \
+            "$DEST_HOST/api/2.1/jobs/create")
+
+          echo "$create_response"
+
+          job_id=$(echo "$create_response" | jq -r '.job_id')
+
+          if [ -z "$job_id" ] || [ "$job_id" = "null" ]; then
+            echo "No se pudo crear el workflow de producción"
+            exit 1
+          fi
+
+          echo "JOB_ID=$job_id" >> $GITHUB_ENV
+          echo "Workflow PROD creado con job_id=$job_id"
+
+      - name: Run production workflow
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+          JOB_ID="${{ env.JOB_ID }}"
+
+          run_response=$(curl -s -X POST \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"job_id\": $JOB_ID}" \
+            "$DEST_HOST/api/2.1/jobs/run-now")
+
+          echo "$run_response"
+
+          run_id=$(echo "$run_response" | jq -r '.run_id')
+
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "No se pudo ejecutar el workflow de producción"
+            exit 1
+          fi
+
+          echo "RUN_ID=$run_id" >> $GITHUB_ENV
+
+      - name: Monitor production workflow execution
+        run: |
+          DEST_HOST="${{ secrets.DATABRICKS_DEST_HOST }}"
+          DEST_TOKEN="${{ secrets.DATABRICKS_DEST_TOKEN }}"
+          RUN_ID="${{ env.RUN_ID }}"
+
+          max_wait=3600
+          waited=0
+          interval=30
+
+          while [ $waited -lt $max_wait ]; do
+            run_status=$(curl -s -X GET \
+              -H "Authorization: Bearer $DEST_TOKEN" \
+              "$DEST_HOST/api/2.1/jobs/runs/get?run_id=$RUN_ID")
+
+            life_cycle=$(echo "$run_status" | jq -r '.state.life_cycle_state')
+            result_state=$(echo "$run_status" | jq -r '.state.result_state // "RUNNING"')
+
+            echo "Estado PROD: $life_cycle / $result_state"
+
+            if [ "$life_cycle" = "TERMINATED" ]; then
+              if [ "$result_state" = "SUCCESS" ]; then
+                echo "Workflow PROD ejecutado correctamente"
+                exit 0
+              else
+                echo "Workflow PROD terminó con error"
+                echo "$run_status" | jq '.'
+                exit 1
+              fi
+            fi
+
+            if [ "$life_cycle" = "INTERNAL_ERROR" ] || [ "$life_cycle" = "SKIPPED" ]; then
+              echo "Workflow PROD falló"
+              echo "$run_status" | jq '.'
+              exit 1
+            fi
+
+            sleep $interval
+            waited=$((waited + interval))
+          done
+
+          echo "Timeout monitoreando workflow PROD"
+          exit 1
